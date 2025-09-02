@@ -1,0 +1,294 @@
+import serial
+import struct
+import numpy as np
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
+import sounddevice as sd
+import wave
+from datetime import datetime
+from PyQt5.QtWidgets import QLabel, QSpinBox
+
+# ==== Config ====
+SERIAL_PORT = 'COM3'
+BAUD_RATE = 1500000
+BYTES_PER_SAMPLE = 3
+SAMPLE_RATE = 31994
+WINDOW_SIZE = 2048
+READ_BLOCK_SIZE = 512
+
+
+def bytes_to_signed_24bit(b: bytes) -> int:
+    value = b[0] | (b[1] << 8) | (b[2] << 16)
+    if value & 0x800000:
+        value -= 1 << 24
+    return value
+
+
+class SerialReader(QtCore.QThread):
+    data_received = QtCore.pyqtSignal(bytes)
+
+    def __init__(self, port, baudrate, read_block_size=512, parent=None):
+        super().__init__(parent)
+        self.port = port
+        self.baudrate = baudrate
+        self.read_block_size = read_block_size
+        self._running = True
+        self.ser = None
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.ser.reset_input_buffer()
+        except serial.SerialException as e:
+            print(f"Error opening serial port: {e}")
+            return
+
+        while self._running:
+            try:
+                raw = self.ser.read(self.read_block_size)
+                if raw:
+                    self.data_received.emit(raw)
+            except Exception as e:
+                print(f"Serial read error: {e}")
+                self._running = False
+
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
+    def stop(self):
+        self._running = False
+        self.wait()
+
+
+class AudioVisualizer(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Real-Time Audio Visualizer")
+
+        # ==== Buffers ====
+        self.buffer = bytearray()
+        self.data = np.zeros(WINDOW_SIZE, dtype=np.int32)
+        self.plot_fft = False
+        self.recording = False
+        self.playing = False
+        self.recorded_samples = []
+        self.gain_factor = 1
+
+        # ==== GUI ====
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        self.plot_widget = pg.PlotWidget(title="Audio Input")
+        self.curve = self.plot_widget.plot(self.data, pen='y')
+        self.plot_widget.setYRange(-8500000, 8500000)
+        self.plot_widget.setXRange(0, WINDOW_SIZE)
+        layout.addWidget(self.plot_widget)
+
+        # ==== CSV recording controls ====
+        csv_layout = QtWidgets.QHBoxLayout()
+        self.duration_spinbox = QSpinBox()
+        self.duration_spinbox.setRange(1, 60)
+        self.duration_spinbox.setValue(1)
+        self.duration_spinbox.setSuffix(" min")
+        csv_layout.addWidget(QtWidgets.QLabel("CSV Record Duration:"))
+        csv_layout.addWidget(self.duration_spinbox)
+
+        self.csv_record_btn = QtWidgets.QPushButton("Start CSV Recording")
+        self.csv_record_btn.setCheckable(True)
+        self.csv_record_btn.clicked.connect(self.toggle_csv_recording)
+        csv_layout.addWidget(self.csv_record_btn)
+
+        layout.addLayout(csv_layout)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+
+        self.mode_btn = QtWidgets.QPushButton("Switch to FFT")
+        self.mode_btn.clicked.connect(self.toggle_mode)
+        btn_layout.addWidget(self.mode_btn)
+
+        self.record_btn = QtWidgets.QPushButton("Start Recording")
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self.toggle_recording)
+        btn_layout.addWidget(self.record_btn)
+
+        self.play_btn = QtWidgets.QPushButton("Play Recording")
+        self.play_btn.clicked.connect(self.play_recording)
+        btn_layout.addWidget(self.play_btn)
+
+        self.idle_btn = QtWidgets.QPushButton("Idle Mode")
+        self.idle_btn.clicked.connect(self.set_idle_mode)
+        btn_layout.addWidget(self.idle_btn)
+
+        # Gain controls
+        self.gain_label = QtWidgets.QLabel(f"Gain: x{self.gain_factor}")
+        btn_layout.addWidget(self.gain_label)
+
+        self.gain_inc_btn = QtWidgets.QPushButton("Gain +")
+        self.gain_inc_btn.clicked.connect(self.increase_gain)
+        btn_layout.addWidget(self.gain_inc_btn)
+
+        self.gain_dec_btn = QtWidgets.QPushButton("Gain -")
+        self.gain_dec_btn.clicked.connect(self.decrease_gain)
+        btn_layout.addWidget(self.gain_dec_btn)
+
+        layout.addLayout(btn_layout)
+
+        # ==== CSV recording variables ====
+        self.csv_recording = False
+        self.csv_recorded_samples = []
+        self.csv_record_timer = QtCore.QTimer()
+        self.csv_record_timer.timeout.connect(self.stop_csv_recording)
+
+        # ==== Serial reader thread ====
+        self.serial_thread = SerialReader(SERIAL_PORT, BAUD_RATE, READ_BLOCK_SIZE)
+        self.serial_thread.data_received.connect(self.on_serial_data)
+        self.serial_thread.start()
+
+        # ==== Update timer ====
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(20)  # 20 ms for ~50 FPS GUI update
+
+    def increase_gain(self):
+        self.gain_factor *= 2
+        self.gain_label.setText(f"Gain: x{self.gain_factor}")
+
+    def decrease_gain(self):
+        if self.gain_factor > 1:
+            self.gain_factor //= 2
+            self.gain_label.setText(f"Gain: x{self.gain_factor}")
+
+    def toggle_csv_recording(self):
+        if not self.csv_recording:
+            duration_min = self.duration_spinbox.value()
+            self.csv_recorded_samples.clear()
+            self.csv_recording = True
+            self.csv_record_btn.setText("Stop CSV Recording")
+            self.csv_record_timer.start(duration_min * 60 * 1000)
+            print(f"Started CSV recording for {duration_min} minute(s).")
+        else:
+            self.stop_csv_recording()
+
+    def stop_csv_recording(self):
+        if self.csv_recording:
+            self.csv_recording = False
+            self.csv_record_btn.setChecked(False)
+            self.csv_record_btn.setText("Start CSV Recording")
+            self.csv_record_timer.stop()
+            self.save_csv()
+            print("CSV recording stopped and saved.")
+
+    def save_csv(self):
+        if not self.csv_recorded_samples:
+            print("No CSV data to save.")
+            return
+        filename = datetime.now().strftime("recorded_%Y%m%d_%H%M%S.csv")
+        try:
+            import csv
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['SampleIndex', 'AudioSample'])
+                for i, sample in enumerate(self.csv_recorded_samples):
+                    writer.writerow([i, sample])
+            print(f"CSV saved: {filename}")
+        except Exception as e:
+            print(f"Error saving CSV: {e}")
+
+    def toggle_mode(self):
+        self.plot_fft = not self.plot_fft
+        self.mode_btn.setText("Switch to Waveform" if self.plot_fft else "Switch to FFT")
+        if self.plot_fft:
+            self.plot_widget.setYRange(0, 1e7)
+            self.plot_widget.setTitle("FFT Spectrum")
+            self.plot_widget.setXRange(0, SAMPLE_RATE / 2)
+        else:
+            self.plot_widget.setYRange(-8500000, 8500000)
+            self.plot_widget.setTitle("Audio Waveform")
+
+    def toggle_recording(self):
+        self.recording = self.record_btn.isChecked()
+        self.record_btn.setText("Stop Recording" if self.recording else "Start Recording")
+        if not self.recording and self.recorded_samples:
+            self.save_wav()
+
+    def set_idle_mode(self):
+        self.recording = False
+        self.record_btn.setChecked(False)
+        self.record_btn.setText("Start Recording")
+        self.playing = False
+        self.plot_widget.setTitle("Live Only (Idle Mode)")
+
+    def play_recording(self):
+        if not self.recorded_samples:
+            print("No recording to play.")
+            return
+        self.playing = True
+        print("Playing recording...")
+        norm_data = np.array(self.recorded_samples, dtype=np.float32) / 8388608.0
+        sd.play(norm_data, SAMPLE_RATE)
+        sd.wait()
+        self.playing = False
+        print("Playback done.")
+
+    def save_wav(self):
+        filename = datetime.now().strftime("recorded_%Y%m%d_%H%M%S.wav")
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(3)
+            wf.setframerate(SAMPLE_RATE)
+            for sample in self.recorded_samples:
+                s = max(min(sample, 8388607), -8388608)
+                wf.writeframes(struct.pack('<i', s)[:3])
+        print(f"Saved: {filename}")
+
+    @QtCore.pyqtSlot(bytes)
+    def on_serial_data(self, raw):
+        # Called from serial thread when new raw bytes arrive
+        self.buffer.extend(raw)
+
+        if len(self.buffer) > 10000:
+            print("⚠️ Warning: buffer overrun, discarding old data")
+            self.buffer = self.buffer[-10000:]
+
+        new_samples = []
+        while len(self.buffer) >= BYTES_PER_SAMPLE:
+            sample_bytes = self.buffer[:BYTES_PER_SAMPLE]
+            self.buffer = self.buffer[BYTES_PER_SAMPLE:]
+            sample = bytes_to_signed_24bit(sample_bytes)
+            sample = int(sample * self.gain_factor)
+            sample = max(min(sample, 8388607), -8388608)
+            new_samples.append(sample)
+            if self.recording:
+                self.recorded_samples.append(sample)
+            if self.csv_recording:
+                self.csv_recorded_samples.append(sample)
+
+        if new_samples:
+            shift_len = min(len(new_samples), WINDOW_SIZE)
+            self.data = np.roll(self.data, -shift_len)
+            self.data[-shift_len:] = new_samples[-shift_len:]
+
+    def update_plot(self):
+        if self.plot_fft:
+            fft_data = np.fft.rfft(self.data * np.hamming(len(self.data)))
+            fft_magnitude = np.abs(fft_data)
+            freqs = np.fft.rfftfreq(len(self.data), d=1.0 / SAMPLE_RATE)
+            self.curve.setData(freqs, fft_magnitude)
+        else:
+            self.curve.setData(self.data)
+
+    def closeEvent(self, event):
+        # Stop serial thread properly on exit
+        self.serial_thread.stop()
+        event.accept()
+
+
+# ==== Run ====
+if __name__ == "__main__":
+    import sys
+
+    app = QtWidgets.QApplication(sys.argv)
+    visualizer = AudioVisualizer()
+    visualizer.show()
+    sys.exit(app.exec_())
